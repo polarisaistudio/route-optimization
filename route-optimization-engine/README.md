@@ -154,6 +154,8 @@ route-optimization-engine/
 
 ## Getting Started
 
+> For detailed setup, running, testing, and troubleshooting instructions, see **[DEVELOPMENT.md](DEVELOPMENT.md)**.
+
 ### Prerequisites
 
 - **Python 3.9+** with pip
