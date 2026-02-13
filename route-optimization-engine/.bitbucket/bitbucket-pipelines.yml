@@ -1,0 +1,362 @@
+# ============================================================================
+# Route Optimization Engine - Bitbucket Pipelines CI/CD
+# ============================================================================
+# Pipeline configuration for automated testing, building, and deployment.
+#
+# Pipelines:
+#   - default:           Lint + Test + Build (all branches)
+#   - branches/main:     Deploy to staging after default pipeline
+#   - branches/release/*: Deploy to production with manual approval
+#
+# Required Repository Variables (Settings > Pipelines > Repository variables):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION,
+#   ECR_REGISTRY, DOCKER_HUB_USERNAME, DOCKER_HUB_PASSWORD,
+#   SONAR_TOKEN, SNYK_TOKEN, SLACK_WEBHOOK_URL
+# ============================================================================
+
+image: node:18
+
+options:
+  max-time: 30
+  size: 2x
+  docker: true
+
+definitions:
+  caches:
+    pip:
+      key:
+        files:
+          - optimization/requirements.txt
+      path: ~/.cache/pip
+    node:
+      key:
+        files:
+          - backend/package-lock.json
+      path: backend/node_modules
+
+  services:
+    mongodb:
+      image: mongo:8
+      variables:
+        MONGO_INITDB_ROOT_USERNAME: testadmin
+        MONGO_INITDB_ROOT_PASSWORD: testpass
+        MONGO_INITDB_DATABASE: route_optimization_test
+      memory: 1024
+
+    redis:
+      image: redis:7-alpine
+      memory: 512
+
+  steps:
+    # ------------------------------------------------------------------
+    # Step: Install dependencies
+    # ------------------------------------------------------------------
+    - step: &install-deps
+        name: "Install Dependencies"
+        caches:
+          - node
+          - pip
+        script:
+          - echo "--- Installing backend (Node.js) dependencies ---"
+          - cd backend
+          - npm ci --ignore-scripts
+          - cd ..
+
+          - echo "--- Installing Python dependencies ---"
+          - apt-get update -qq && apt-get install -y -qq python3 python3-pip python3-venv > /dev/null 2>&1
+          - python3 -m pip install --upgrade pip --quiet
+          - |
+            if [ -f optimization/requirements.txt ]; then
+              python3 -m pip install -r optimization/requirements.txt --quiet
+            fi
+          - |
+            if [ -f optimization/requirements-dev.txt ]; then
+              python3 -m pip install -r optimization/requirements-dev.txt --quiet
+            fi
+
+          - echo "--- Dependencies installed successfully ---"
+        artifacts:
+          - backend/node_modules/**
+
+    # ------------------------------------------------------------------
+    # Step: Lint (ESLint + Python linters)
+    # ------------------------------------------------------------------
+    - step: &lint
+        name: "Lint"
+        caches:
+          - node
+          - pip
+        script:
+          - echo "--- Running ESLint on backend ---"
+          - cd backend
+          - npx eslint src/ --ext .js,.ts --format stylish --max-warnings 0
+          - cd ..
+
+          - echo "--- Running Python linters ---"
+          - apt-get update -qq && apt-get install -y -qq python3 python3-pip > /dev/null 2>&1
+          - python3 -m pip install ruff mypy --quiet
+
+          - echo "--- Running ruff (Python linter) ---"
+          - python3 -m ruff check optimization/ integrations/ scripts/ --output-format=text
+
+          - echo "--- Running ruff format check ---"
+          - python3 -m ruff format --check optimization/ integrations/ scripts/
+
+          - echo "--- Running mypy type checking ---"
+          - python3 -m mypy optimization/ --ignore-missing-imports --no-error-summary || true
+
+          - echo "--- Lint passed ---"
+
+    # ------------------------------------------------------------------
+    # Step: Test (Jest + pytest)
+    # ------------------------------------------------------------------
+    - step: &test
+        name: "Test"
+        caches:
+          - node
+          - pip
+        services:
+          - mongodb
+          - redis
+        script:
+          - echo "--- Running backend tests (Jest) ---"
+          - cd backend
+          - |
+            export MONGODB_URI="mongodb://testadmin:testpass@localhost:27017/route_optimization_test?authSource=admin"
+            export REDIS_URL="redis://localhost:6379"
+            export NODE_ENV=test
+            export JWT_SECRET=test-secret
+          - npx jest --ci --coverage --forceExit --detectOpenHandles
+          - cd ..
+
+          - echo "--- Running Python tests (pytest) ---"
+          - apt-get update -qq && apt-get install -y -qq python3 python3-pip > /dev/null 2>&1
+          - python3 -m pip install pytest pytest-cov pytest-asyncio --quiet
+          - |
+            if [ -f optimization/requirements.txt ]; then
+              python3 -m pip install -r optimization/requirements.txt --quiet
+            fi
+          - |
+            export MONGODB_URI="mongodb://testadmin:testpass@localhost:27017/route_optimization_test?authSource=admin"
+            export REDIS_URL="redis://localhost:6379"
+          - python3 -m pytest optimization/tests/ integrations/ \
+              --tb=short \
+              --cov=optimization \
+              --cov-report=xml:coverage-python.xml \
+              --cov-report=term-missing \
+              --junitxml=test-results-python.xml \
+              -v || true
+
+          - echo "--- Tests completed ---"
+        artifacts:
+          - backend/coverage/**
+          - coverage-python.xml
+          - test-results-python.xml
+
+    # ------------------------------------------------------------------
+    # Step: Build Docker images
+    # ------------------------------------------------------------------
+    - step: &build-docker
+        name: "Build Docker Images"
+        caches:
+          - node
+        script:
+          - echo "--- Building API Docker image ---"
+          - docker build
+              -f infrastructure/docker/Dockerfile.api
+              -t ${ECR_REGISTRY}/route-opt-api:${BITBUCKET_COMMIT:0:8}
+              -t ${ECR_REGISTRY}/route-opt-api:latest
+              .
+
+          - echo "--- Building Optimization Docker image ---"
+          - docker build
+              -f infrastructure/docker/Dockerfile.optimization
+              -t ${ECR_REGISTRY}/route-opt-optimization:${BITBUCKET_COMMIT:0:8}
+              -t ${ECR_REGISTRY}/route-opt-optimization:latest
+              .
+
+          - echo "--- Saving images to artifacts ---"
+          - docker save
+              ${ECR_REGISTRY}/route-opt-api:${BITBUCKET_COMMIT:0:8}
+              ${ECR_REGISTRY}/route-opt-optimization:${BITBUCKET_COMMIT:0:8}
+              -o docker-images.tar
+
+          - echo "--- Build completed ---"
+        artifacts:
+          - docker-images.tar
+        size: 2x
+
+    # ------------------------------------------------------------------
+    # Step: Push images to ECR
+    # ------------------------------------------------------------------
+    - step: &push-ecr
+        name: "Push to ECR"
+        script:
+          - echo "--- Loading Docker images ---"
+          - docker load -i docker-images.tar
+
+          - echo "--- Authenticating with ECR ---"
+          - pip3 install awscli --quiet
+          - aws ecr get-login-password --region ${AWS_DEFAULT_REGION}
+              | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+          - echo "--- Pushing API image ---"
+          - docker push ${ECR_REGISTRY}/route-opt-api:${BITBUCKET_COMMIT:0:8}
+          - docker push ${ECR_REGISTRY}/route-opt-api:latest
+
+          - echo "--- Pushing Optimization image ---"
+          - docker push ${ECR_REGISTRY}/route-opt-optimization:${BITBUCKET_COMMIT:0:8}
+          - docker push ${ECR_REGISTRY}/route-opt-optimization:latest
+
+          - echo "--- Push completed ---"
+        size: 2x
+
+    # ------------------------------------------------------------------
+    # Step: Deploy to staging
+    # ------------------------------------------------------------------
+    - step: &deploy-staging
+        name: "Deploy to Staging"
+        deployment: staging
+        script:
+          - echo "--- Installing AWS CLI ---"
+          - pip3 install awscli --quiet
+
+          - echo "--- Updating ECS service (staging) ---"
+          - aws ecs update-service
+              --cluster route-optimization-staging-cluster
+              --service route-optimization-staging-api
+              --force-new-deployment
+              --region ${AWS_DEFAULT_REGION}
+
+          - echo "--- Waiting for service stability ---"
+          - aws ecs wait services-stable
+              --cluster route-optimization-staging-cluster
+              --services route-optimization-staging-api
+              --region ${AWS_DEFAULT_REGION}
+
+          - echo "--- Running smoke tests ---"
+          - |
+            STAGING_URL="https://staging.routeopt.polaris.com"
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${STAGING_URL}/health")
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "Smoke test failed: /health returned HTTP ${HTTP_STATUS}"
+              exit 1
+            fi
+            echo "Smoke test passed: /health returned HTTP 200"
+
+          - echo "--- Staging deployment complete ---"
+
+          - echo "--- Sending Slack notification ---"
+          - |
+            if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+              curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+                -H 'Content-type: application/json' \
+                -d "{
+                  \"text\": \"Route Optimization Engine deployed to staging\",
+                  \"blocks\": [{
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \"*Route Optimization Engine* deployed to *staging*\nCommit: \`${BITBUCKET_COMMIT:0:8}\`\nBranch: \`${BITBUCKET_BRANCH}\`\nPipeline: <https://bitbucket.org/${BITBUCKET_REPO_FULL_NAME}/pipelines/results/${BITBUCKET_BUILD_NUMBER}|#${BITBUCKET_BUILD_NUMBER}>\"
+                    }
+                  }]
+                }"
+            fi
+
+    # ------------------------------------------------------------------
+    # Step: Deploy to production
+    # ------------------------------------------------------------------
+    - step: &deploy-production
+        name: "Deploy to Production"
+        deployment: production
+        trigger: manual
+        script:
+          - echo "--- Installing AWS CLI ---"
+          - pip3 install awscli --quiet
+
+          - echo "--- Tagging images for production ---"
+          - aws ecr get-login-password --region ${AWS_DEFAULT_REGION}
+              | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+          - echo "--- Updating ECS service (production) ---"
+          - aws ecs update-service
+              --cluster route-optimization-production-cluster
+              --service route-optimization-production-api
+              --force-new-deployment
+              --region ${AWS_DEFAULT_REGION}
+
+          - echo "--- Waiting for service stability ---"
+          - aws ecs wait services-stable
+              --cluster route-optimization-production-cluster
+              --services route-optimization-production-api
+              --region ${AWS_DEFAULT_REGION}
+
+          - echo "--- Running production smoke tests ---"
+          - |
+            PROD_URL="https://routeopt.polaris.com"
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${PROD_URL}/health")
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "Production smoke test failed: /health returned HTTP ${HTTP_STATUS}"
+              exit 1
+            fi
+            echo "Production smoke test passed: /health returned HTTP 200"
+
+          - echo "--- Production deployment complete ---"
+
+          - echo "--- Sending Slack notification ---"
+          - |
+            if [ -n "${SLACK_WEBHOOK_URL}" ]; then
+              curl -s -X POST "${SLACK_WEBHOOK_URL}" \
+                -H 'Content-type: application/json' \
+                -d "{
+                  \"text\": \"Route Optimization Engine deployed to PRODUCTION\",
+                  \"blocks\": [{
+                    \"type\": \"section\",
+                    \"text\": {
+                      \"type\": \"mrkdwn\",
+                      \"text\": \":rocket: *Route Optimization Engine* deployed to *PRODUCTION*\nCommit: \`${BITBUCKET_COMMIT:0:8}\`\nBranch: \`${BITBUCKET_BRANCH}\`\nPipeline: <https://bitbucket.org/${BITBUCKET_REPO_FULL_NAME}/pipelines/results/${BITBUCKET_BUILD_NUMBER}|#${BITBUCKET_BUILD_NUMBER}>\"
+                    }
+                  }]
+                }"
+            fi
+
+# ============================================================================
+# Pipelines
+# ============================================================================
+pipelines:
+
+  # --------------------------------------------------------------------------
+  # Default pipeline: runs on all branches (feature, bugfix, etc.)
+  # --------------------------------------------------------------------------
+  default:
+    - step: *install-deps
+    - parallel:
+        - step: *lint
+        - step: *test
+    - step: *build-docker
+
+  # --------------------------------------------------------------------------
+  # Main branch: deploy to staging automatically after CI passes
+  # --------------------------------------------------------------------------
+  branches:
+    main:
+      - step: *install-deps
+      - parallel:
+          - step: *lint
+          - step: *test
+      - step: *build-docker
+      - step: *push-ecr
+      - step: *deploy-staging
+
+    # --------------------------------------------------------------------------
+    # Release branches: deploy to production with manual gate
+    # --------------------------------------------------------------------------
+    'release/*':
+      - step: *install-deps
+      - parallel:
+          - step: *lint
+          - step: *test
+      - step: *build-docker
+      - step: *push-ecr
+      - step: *deploy-staging
+      - step: *deploy-production

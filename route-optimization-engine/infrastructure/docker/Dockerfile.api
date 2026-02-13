@@ -1,0 +1,106 @@
+# ============================================================================
+# Route Optimization Engine - API Backend Dockerfile
+# ============================================================================
+# Multi-stage build for the Node.js backend API service.
+# Produces a minimal production image with only runtime dependencies.
+#
+# Build:  docker build -f infrastructure/docker/Dockerfile.api -t route-opt-api .
+# Run:    docker run -p 3001:3001 --env-file .env route-opt-api
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# Stage 1: Dependencies
+# --------------------------------------------------------------------------
+FROM node:18-alpine AS deps
+
+WORKDIR /app
+
+# Install build tools needed for native modules (e.g., bcrypt, canvas)
+RUN apk add --no-cache python3 make g++
+
+# Copy dependency manifests first for optimal layer caching
+COPY backend/package.json backend/package-lock.json* ./
+
+# Install all dependencies (including devDependencies for build stage)
+RUN npm ci --ignore-scripts && \
+    npm rebuild
+
+# --------------------------------------------------------------------------
+# Stage 2: Build
+# --------------------------------------------------------------------------
+FROM node:18-alpine AS build
+
+WORKDIR /app
+
+# Copy dependencies from previous stage
+COPY --from=deps /app/node_modules ./node_modules
+COPY backend/package.json ./
+
+# Copy application source
+COPY backend/src ./src
+COPY backend/tsconfig.json* ./
+
+# Build TypeScript if tsconfig exists, otherwise skip
+RUN if [ -f tsconfig.json ]; then \
+      npx tsc --build; \
+    else \
+      echo "No TypeScript config found, skipping build step"; \
+    fi
+
+# Prune devDependencies for production
+RUN npm prune --production
+
+# --------------------------------------------------------------------------
+# Stage 3: Production Runtime
+# --------------------------------------------------------------------------
+FROM node:18-alpine AS production
+
+# Add metadata labels
+LABEL maintainer="Polaris Real Estate Engineering <eng@polaris.com>"
+LABEL description="Route Optimization Engine - API Backend"
+LABEL version="1.0.0"
+
+# Security: run as non-root user
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -S appuser -u 1001 -G appgroup
+
+WORKDIR /app
+
+# Install runtime-only system dependencies
+RUN apk add --no-cache \
+    curl \
+    tini \
+    && rm -rf /var/cache/apk/*
+
+# Copy production dependencies
+COPY --from=build --chown=appuser:appgroup /app/node_modules ./node_modules
+
+# Copy built application (dist if TypeScript, src otherwise)
+COPY --from=build --chown=appuser:appgroup /app/package.json ./
+COPY --from=build --chown=appuser:appgroup /app/src ./src
+COPY --from=build --chown=appuser:appgroup /app/dist* ./dist/
+
+# Create directories for logs and temp files
+RUN mkdir -p /app/logs /app/tmp && \
+    chown -R appuser:appgroup /app/logs /app/tmp
+
+# Switch to non-root user
+USER appuser
+
+# Expose API port
+EXPOSE 3001
+
+# Set environment defaults
+ENV NODE_ENV=production \
+    PORT=3001 \
+    LOG_LEVEL=info
+
+# Use tini as init process for proper signal handling
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -f http://localhost:3001/health || exit 1
+
+# Start the application
+CMD ["node", "src/index.js"]

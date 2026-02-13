@@ -1,0 +1,97 @@
+# ============================================================================
+# Route Optimization Engine - Python Optimization Service Dockerfile
+# ============================================================================
+# Builds the Python-based route optimization service that runs the core
+# algorithms (OR-Tools, genetic algorithm, simulated annealing).
+#
+# Build:  docker build -f infrastructure/docker/Dockerfile.optimization -t route-opt-optimization .
+# Run:    docker run -p 8000:8000 --env-file .env route-opt-optimization
+# ============================================================================
+
+# --------------------------------------------------------------------------
+# Stage 1: Dependencies
+# --------------------------------------------------------------------------
+FROM python:3.11-slim AS deps
+
+WORKDIR /app
+
+# Install system-level build dependencies required by optimization libraries
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        g++ \
+        libgeos-dev \
+        libspatialindex-dev \
+        curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy and install Python dependencies
+COPY optimization/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# --------------------------------------------------------------------------
+# Stage 2: Production Runtime
+# --------------------------------------------------------------------------
+FROM python:3.11-slim AS production
+
+# Add metadata labels
+LABEL maintainer="Polaris Real Estate Engineering <eng@polaris.com>"
+LABEL description="Route Optimization Engine - Python Optimization Service"
+LABEL version="1.0.0"
+
+WORKDIR /app
+
+# Install runtime-only system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgeos-c1v5 \
+        libspatialindex6 \
+        curl \
+        tini \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed Python packages from deps stage
+COPY --from=deps /install /usr/local
+
+# Security: create non-root user
+RUN groupadd -g 1001 appgroup && \
+    useradd -u 1001 -g appgroup -s /bin/bash -m appuser
+
+# Copy optimization engine source code
+COPY --chown=appuser:appgroup optimization/ ./optimization/
+
+# Copy utility scripts
+COPY --chown=appuser:appgroup scripts/ ./scripts/
+
+# Create directories for logs and temporary output
+RUN mkdir -p /app/logs /app/tmp /app/output && \
+    chown -R appuser:appgroup /app/logs /app/tmp /app/output
+
+# Switch to non-root user
+USER appuser
+
+# Expose service port
+EXPOSE 8000
+
+# Set environment defaults
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    LOG_LEVEL=INFO \
+    PORT=8000 \
+    WORKERS=2
+
+# Use tini as init process for proper signal handling
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=45s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Start the optimization service with uvicorn
+CMD ["python", "-m", "uvicorn", "optimization.api:app", \
+     "--host", "0.0.0.0", \
+     "--port", "8000", \
+     "--workers", "2", \
+     "--log-level", "info", \
+     "--access-log"]

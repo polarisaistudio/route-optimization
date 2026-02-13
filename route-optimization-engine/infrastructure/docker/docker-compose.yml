@@ -1,0 +1,220 @@
+# ============================================================================
+# Route Optimization Engine - Local Development Environment
+# ============================================================================
+# Usage:
+#   docker compose up -d          Start all services
+#   docker compose up -d api      Start API and its dependencies
+#   docker compose logs -f api    Tail API logs
+#   docker compose down -v        Stop all services and remove volumes
+# ============================================================================
+
+version: "3.9"
+
+services:
+  # --------------------------------------------------------------------------
+  # MongoDB - Primary data store for routes, work orders, and properties
+  # --------------------------------------------------------------------------
+  mongodb:
+    image: mongo:8
+    container_name: route-opt-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME:-routeadmin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-routepass123}
+      MONGO_INITDB_DATABASE: route_optimization
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - ./init-mongo.js:/docker-entrypoint-initdb.d/init-mongo.js:ro
+    networks:
+      - route-opt-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # --------------------------------------------------------------------------
+  # Redis - Caching, rate limiting, and job queue broker
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: route-opt-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redispass123}
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    volumes:
+      - redis_data:/data
+    networks:
+      - route-opt-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redispass123}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # --------------------------------------------------------------------------
+  # LocalStack - AWS service emulation (S3, SQS, SNS, Lambda)
+  # --------------------------------------------------------------------------
+  localstack:
+    image: localstack/localstack:3
+    container_name: route-opt-localstack
+    restart: unless-stopped
+    ports:
+      - "4566:4566"       # LocalStack gateway
+      - "4510-4559:4510-4559"  # External service ports
+    environment:
+      SERVICES: s3,sqs,sns,lambda
+      DEBUG: ${LOCALSTACK_DEBUG:-0}
+      DATA_DIR: /var/lib/localstack/data
+      DOCKER_HOST: unix:///var/run/docker.sock
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - localstack_data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - route-opt-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # --------------------------------------------------------------------------
+  # API - Node.js backend service
+  # --------------------------------------------------------------------------
+  api:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.api
+    container_name: route-opt-api
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      LOG_LEVEL: debug
+      # MongoDB
+      MONGODB_URI: mongodb://${MONGO_USERNAME:-routeadmin}:${MONGO_PASSWORD:-routepass123}@mongodb:27017/route_optimization?authSource=admin
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispass123}@redis:6379
+      # AWS (LocalStack)
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      S3_BUCKET_NAME: route-optimization-data
+      SQS_QUEUE_URL: http://localstack:4566/000000000000/optimization-jobs
+      SNS_TOPIC_ARN: arn:aws:sns:us-east-1:000000000000:route-notifications
+      # Optimization service
+      OPTIMIZATION_SERVICE_URL: http://optimization:8000
+      # Auth (disabled in local dev)
+      AUTH_ENABLED: "false"
+      JWT_SECRET: local-dev-secret-key-do-not-use-in-production
+    volumes:
+      - ../../backend/src:/app/src:ro
+      - ../../backend/package.json:/app/package.json:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    networks:
+      - route-opt-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3001/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # Optimization - Python optimization engine service
+  # --------------------------------------------------------------------------
+  optimization:
+    build:
+      context: ../../
+      dockerfile: infrastructure/docker/Dockerfile.optimization
+    container_name: route-opt-optimization
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      PYTHONUNBUFFERED: 1
+      LOG_LEVEL: DEBUG
+      # MongoDB
+      MONGODB_URI: mongodb://${MONGO_USERNAME:-routeadmin}:${MONGO_PASSWORD:-routepass123}@mongodb:27017/route_optimization?authSource=admin
+      # Redis
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redispass123}@redis:6379
+      # AWS (LocalStack)
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    volumes:
+      - ../../optimization:/app/optimization:ro
+      - ../../scripts:/app/scripts:ro
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - route-opt-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+
+# ============================================================================
+# Volumes
+# ============================================================================
+volumes:
+  mongodb_data:
+    driver: local
+    name: route-opt-mongodb-data
+  mongodb_config:
+    driver: local
+    name: route-opt-mongodb-config
+  redis_data:
+    driver: local
+    name: route-opt-redis-data
+  localstack_data:
+    driver: local
+    name: route-opt-localstack-data
+
+# ============================================================================
+# Networks
+# ============================================================================
+networks:
+  route-opt-network:
+    driver: bridge
+    name: route-opt-network

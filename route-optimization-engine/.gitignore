@@ -1,0 +1,46 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build output
+frontend/.next/
+frontend/out/
+*.js.map
+
+# Data files (keep samples, ignore generated)
+data/generated/
+*.csv
+!data/sample/*.csv
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+
+# Docker
+docker-compose.override.yml
